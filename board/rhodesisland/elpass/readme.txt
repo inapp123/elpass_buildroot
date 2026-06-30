@@ -22,6 +22,8 @@ Before building, copy the Vivado-generated bitstream to:
     board/rhodesisland/elpass/system.bit
 
 The post-build script will fail if this file is missing.
+It is embedded into u-boot.img as a FIT loadable; SPL programs the PL
+before loading U-Boot (CONFIG_SPL_FPGA is enabled in xilinx_zynq_virt).
 
 Board files:
 
@@ -30,6 +32,13 @@ Board files:
  - pl.dtsi             PL 外设 (el_display_engine 等)
  - ps7_init_gpl.c/h    PS7 initialization (from Vivado)
  - system.bit          FPGA bitstream (not in git, add locally)
+ - u-boot-fpga.its     FIT source: SPL loads fpga-1 then firmware-1
+
+Boot flow (SD card):
+
+ boot.bin (SPL) -> u-boot.img (FIT: system.bit + U-Boot + DTB) -> extlinux -> kernel
+
+On serial console you should see "FPGA image loaded from FIT" during SPL boot.
 
 You can alter the booting procedure by creating a file uEnv.txt
 in the root of the SD card. It is a plain text file in format

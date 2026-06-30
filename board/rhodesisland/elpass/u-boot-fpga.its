@@ -1,0 +1,48 @@
+/dts-v1/;
+
+/ {
+	description = "U-Boot FIT with PL bitstream for ArkELPass";
+	#address-cells = <1>;
+
+	images {
+		fpga-1 {
+			description = "PL bitstream";
+			data = /incbin/("system.bit");
+			type = "fpga";
+			arch = "arm";
+			compression = "none";
+			load = <0x01000000>;
+			compatible = "u-boot,fpga-legacy";
+		};
+
+		firmware-1 {
+			description = "U-Boot";
+			data = /incbin/("u-boot-nodtb.bin");
+			type = "firmware";
+			arch = "arm";
+			os = "u-boot";
+			compression = "none";
+			load = <0x04000000>;
+			entry = <0x04000000>;
+		};
+
+		fdt-1 {
+			description = "U-Boot device tree";
+			data = /incbin/("elpass.dtb");
+			type = "flat_dt";
+			arch = "arm";
+			compression = "none";
+		};
+	};
+
+	configurations {
+		default = "config-1";
+
+		config-1 {
+			description = "ELPass: program PL then boot U-Boot";
+			firmware = "firmware-1";
+			fdt = "fdt-1";
+			fpga = "fpga-1";
+		};
+	};
+};

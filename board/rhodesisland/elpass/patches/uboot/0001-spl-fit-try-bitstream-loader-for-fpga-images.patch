@@ -1,0 +1,42 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Buildroot <buildroot@buildroot.org>
+Date: Wed, 1 Jul 2026 02:00:00 +0800
+Subject: [PATCH] spl: fit: try bitstream loader for FPGA images
+
+Vivado .bit files include a header before the raw FPGA configuration
+payload. The regular fpga_load() path expects the payload to start at the
+bitstream sync data, so using it directly from SPL FIT leaves the image in
+DDR but does not program the PL.
+
+Match the non-SPL FIT boot path by trying fpga_loadbitstream() first. If
+that fails, fall back to fpga_load() so existing FIT images containing a
+raw/bin payload continue to work.
+
+Signed-off-by: Buildroot <buildroot@buildroot.org>
+---
+ common/spl/spl_fit.c | 7 ++++++-
+ 1 file changed, 6 insertions(+), 1 deletion(-)
+
+diff --git a/common/spl/spl_fit.c b/common/spl/spl_fit.c
+--- a/common/spl/spl_fit.c
++++ b/common/spl/spl_fit.c
+@@ -615,8 +615,15 @@ static int spl_fit_upload_fpga(struct spl_fit_info *ctx, int node,
+ 			      compatible);
+ 	}
+ 
+-	ret = fpga_load(devnum, (void *)fpga_image->load_addr,
+-			fpga_image->size, BIT_FULL, flags);
++	/*
++	 * Vivado .bit files carry a header. Try the bitstream-aware loader
++	 * first, then keep supporting FIT images that embed raw/bin payloads.
++	 */
++	ret = fpga_loadbitstream(devnum, (void *)fpga_image->load_addr,
++				 fpga_image->size, BIT_FULL);
++	if (ret)
++		ret = fpga_load(devnum, (void *)fpga_image->load_addr,
++				fpga_image->size, BIT_FULL, flags);
+ 	if (ret) {
+ 		printf("%s: Cannot load the image to the FPGA\n", __func__);
+ 		return ret;
+-- 
+2.50.0

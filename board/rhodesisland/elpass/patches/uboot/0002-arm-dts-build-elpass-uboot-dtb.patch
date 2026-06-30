@@ -1,0 +1,30 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Buildroot <buildroot@buildroot.org>
+Date: Wed, 1 Jul 2026 02:06:00 +0800
+Subject: [PATCH] arm: dts: build elpass U-Boot device tree
+
+Buildroot copies board/rhodesisland/elpass/elpass-uboot.dts into
+arch/arm/dts through BR2_TARGET_UBOOT_CUSTOM_DTS_PATH and builds U-Boot
+with DEVICE_TREE=elpass-uboot.
+
+Register the resulting dtb in the Zynq dtb list so U-Boot's dts build can
+produce arch/arm/dts/elpass-uboot.dtb.
+
+Signed-off-by: Buildroot <buildroot@buildroot.org>
+---
+ arch/arm/dts/Makefile | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/arch/arm/dts/Makefile b/arch/arm/dts/Makefile
+--- a/arch/arm/dts/Makefile
++++ b/arch/arm/dts/Makefile
+@@ -221,6 +221,7 @@ dtb-$(CONFIG_ARCH_UNIPHIER_SLD8) += \
+ 	uniphier-sld8-ref.dtb
+ 
+ dtb-$(CONFIG_ARCH_ZYNQ) += \
++	elpass-uboot.dtb \
+ 	bitmain-antminer-s9.dtb \
+ 	zynq-cc108.dtb \
+ 	zynq-cse-nand.dtb \
+-- 
+2.50.0
