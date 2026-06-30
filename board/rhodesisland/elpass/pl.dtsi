@@ -1,0 +1,53 @@
+/ {
+	amba_pl: amba_pl {
+		ranges;
+		compatible = "simple-bus";
+		#address-cells = <1>;
+		#size-cells = <1>;
+		firmware-name = "system.bit";
+
+		clocking1: clocking1 {
+			compatible = "xlnx,fclk";
+			assigned-clocks = <&clkc 16>;
+			assigned-clock-rates = <50000000>;
+			#clock-cells = <0>;
+			clock-output-names = "fabric_clk";
+			clocks = <&clkc 16>;
+		};
+
+		clocking0: clocking0 {
+			compatible = "xlnx,fclk";
+			assigned-clocks = <&clkc 15>;
+			assigned-clock-rates = <100000000>;
+			#clock-cells = <0>;
+			clock-output-names = "fabric_clk";
+			clocks = <&clkc 15>;
+		};
+
+		afi0: afi0@f8008000 {
+			status = "okay";
+			compatible = "xlnx,afi-fpga";
+			#address-cells = <1>;
+			reg = <0xf8008000 0x1000>;
+			#size-cells = <0>;
+			xlnx,afi-width = <0>;
+		};
+
+		misc_clk_0: misc_clk_0 {
+			compatible = "fixed-clock";
+			clock-frequency = <24000000>;
+			#clock-cells = <0>;
+		};
+
+		el_display_engine_0: el_display_engine@43c00000 {
+			compatible = "xlnx,el-display-engine-1.0";
+			reg = <0x43c00000 0x10000>;
+			clocks = <&clkc 15>, <&misc_clk_0>, <&clkc 15>;
+			clock-names = "m00_axi_aclk", "pix_clk", "s00_axi_aclk";
+			interrupt-parent = <&intc>;
+			interrupts = <0 29 4>;
+			interrupt-names = "vsync_irq";
+			status = "okay";
+		};
+	};
+};

@@ -1,0 +1,1166 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Rhodes Island <elpass@example.com>
+Date: Wed, 1 Jul 2026 01:00:00 +0800
+Subject: [PATCH] drm: add el display engine driver
+
+Add a DRM/KMS driver for the el_display_engine PL IP used by the
+Rhodes Island elpass board. The driver can be built in so the probe
+and printk messages appear during normal kernel boot.
+---
+ drivers/gpu/drm/Kconfig                    |    2 +
+ drivers/gpu/drm/Makefile                   |    1 +
+ drivers/gpu/drm/el_display/Kconfig         |   11 +
+ drivers/gpu/drm/el_display/Makefile        |    3 +
+ drivers/gpu/drm/el_display/el_display_drm.c | 1092 +++++++++++++++++++++
+ 5 files changed, 1109 insertions(+)
+ create mode 100644 drivers/gpu/drm/el_display/Kconfig
+ create mode 100644 drivers/gpu/drm/el_display/Makefile
+ create mode 100644 drivers/gpu/drm/el_display/el_display_drm.c
+
+--- a/drivers/gpu/drm/Kconfig
++++ b/drivers/gpu/drm/Kconfig
+@@ -482,3 +482,5 @@
++source "drivers/gpu/drm/el_display/Kconfig"
++
+ source "drivers/gpu/drm/gud/Kconfig"
+ 
+ source "drivers/gpu/drm/solomon/Kconfig"
+--- a/drivers/gpu/drm/Makefile
++++ b/drivers/gpu/drm/Makefile
+@@ -218,9 +218,10 @@
+ obj-$(CONFIG_DRM_ASPEED_GFX) += aspeed/
+ obj-$(CONFIG_DRM_MCDE) += mcde/
+ obj-$(CONFIG_DRM_TIDSS) += tidss/
+ obj-y			+= xlnx/
++obj-$(CONFIG_DRM_EL_DISPLAY) += el_display/
+ obj-y			+= gud/
+ obj-$(CONFIG_DRM_HYPERV) += hyperv/
+ obj-y			+= solomon/
+ obj-$(CONFIG_DRM_SPRD) += sprd/
+ obj-$(CONFIG_DRM_LOONGSON) += loongson/
+diff --git a/drivers/gpu/drm/el_display/Kconfig b/drivers/gpu/drm/el_display/Kconfig
+new file mode 100644
+index 000000000000..111111111111
+--- /dev/null
++++ b/drivers/gpu/drm/el_display/Kconfig
+@@ -0,0 +1,12 @@
++# SPDX-License-Identifier: GPL-2.0-only
++
++config DRM_EL_DISPLAY
++	tristate "EL display engine DRM/KMS driver (LJ64)"
++	depends on DRM && OF
++	depends on COMMON_CLK
++	select DRM_KMS_HELPER
++	select DRM_GEM_DMA_HELPER
++	help
++	  DRM/KMS driver for the Xilinx el_display_engine PL IP used on
++	  the LJ64HB34 EL panel. Built into the kernel (y) so the driver
++	  registers during boot without modprobe.
+diff --git a/drivers/gpu/drm/el_display/Makefile b/drivers/gpu/drm/el_display/Makefile
+new file mode 100644
+index 000000000000..111111111111
+--- /dev/null
++++ b/drivers/gpu/drm/el_display/Makefile
+@@ -0,0 +1,3 @@
++# SPDX-License-Identifier: GPL-2.0-only
++
++obj-$(CONFIG_DRM_EL_DISPLAY) += el_display_drm.o
+diff --git a/drivers/gpu/drm/el_display/el_display_drm.c b/drivers/gpu/drm/el_display/el_display_drm.c
+new file mode 100644
+index 000000000000..111111111111
+--- /dev/null
++++ b/drivers/gpu/drm/el_display/el_display_drm.c
+@@ -0,0 +1,1093 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * DRM/KMS driver for Xilinx el_display_engine PL IP (LJ64HB34 EL panel)
++ */
++
++#include <linux/clk.h>
++#include <linux/cdev.h>
++#include <linux/delay.h>
++#include <linux/dma-mapping.h>
++#include <linux/fs.h>
++#include <linux/interrupt.h>
++#include <linux/init.h>
++#include <linux/io.h>
++#include <linux/module.h>
++#include <linux/of.h>
++#include <linux/printk.h>
++#include <linux/platform_device.h>
++#include <linux/spinlock.h>
++#include <linux/uaccess.h>
++
++#include <drm/drm_atomic.h>
++#include <drm/drm_atomic_helper.h>
++#include <drm/drm_atomic_state_helper.h>
++#include <drm/drm_blend.h>
++#include <drm/drm_connector.h>
++#include <drm/drm_crtc.h>
++#include <drm/drm_damage_helper.h>
++#include <drm/drm_device.h>
++#include <drm/drm_drv.h>
++#include <drm/drm_edid.h>
++#include <drm/drm_fb_dma_helper.h>
++#include <drm/drm_fbdev_dma.h>
++#include <drm/drm_fourcc.h>
++#include <drm/drm_framebuffer.h>
++#include <drm/drm_gem_atomic_helper.h>
++#include <drm/drm_gem_dma_helper.h>
++#include <drm/drm_gem_framebuffer_helper.h>
++#include <drm/drm_managed.h>
++#include <drm/drm_probe_helper.h>
++#include <drm/drm_vblank.h>
++
++#define EL_DISPLAY_NAME		"el_display_engine"
++#define EL_WIDTH		640
++#define EL_HEIGHT		400
++#define EL_PRIMARY_STRIDE	(EL_WIDTH * 4)
++
++#define EL_DITHER_DEFAULT	0
++#define EL_PRIM_THRESH_DEFAULT	128
++#define EL_OVL_THRESH_DEFAULT	127
++
++#define EL_REG_MAIN_BASE	0x00
++#define EL_REG_OVL_BASE		0x04
++#define EL_REG_OVL_SRC_XY	0x08
++#define EL_REG_OVL_SRC_WH	0x0c
++#define EL_REG_OVL_DST_XY	0x10
++#define EL_REG_FLAGS		0x14
++#define EL_REG_FRAME_COUNT	0x18
++#define EL_REG_STATUS		0x1c
++#define EL_REG_MAIN_STRIDE	0x20
++#define EL_REG_OVL_STRIDE	0x24
++
++#define EL_FLAGS_ENABLE		BIT(0)
++#define EL_FLAGS_DITHER_EN	BIT(1)
++#define EL_FLAGS_OVL_EN		BIT(2)
++#define EL_FLAGS_THRESH_SHIFT	8
++#define EL_FLAGS_THRESH_MASK	(0xff << EL_FLAGS_THRESH_SHIFT)
++#define EL_FLAGS_PRIM_THRESH_SHIFT	24
++#define EL_FLAGS_PRIM_THRESH_MASK	(0xff << EL_FLAGS_PRIM_THRESH_SHIFT)
++#define EL_FLAGS_PFMT_SHIFT	16
++#define EL_FLAGS_PFMT_AR32	0
++#define EL_FLAGS_PFMT_NV12	1
++
++struct el_primary_state {
++	struct drm_plane_state base;
++	u32 dither;
++	u32 prim_thresh;
++};
++
++struct el_overlay_state {
++	struct drm_plane_state base;
++	u32 thresh;
++};
++
++struct el_display {
++	struct drm_device drm;
++	struct drm_crtc crtc;
++	struct drm_plane primary;
++	struct drm_plane overlay;
++	struct drm_encoder encoder;
++	struct drm_connector connector;
++
++	void __iomem *regs;
++	struct clk *m00_axi_aclk;
++	struct clk *pix_clk;
++	struct clk *s00_axi_aclk;
++	int irq;
++
++	spinlock_t reg_lock;
++	u32 flags_cache;
++
++	struct drm_property *primary_dither_prop;
++	struct drm_property *primary_thresh_prop;
++	struct drm_property *overlay_thresh_prop;
++
++	struct device *dev;
++	dev_t chrdev_devt;
++	struct cdev chrdev;
++	struct device *chrdev_device;
++};
++
++static inline struct el_display *to_el_display(struct drm_device *drm)
++{
++	return container_of(drm, struct el_display, drm);
++}
++
++static inline struct el_primary_state *to_el_primary_state(struct drm_plane_state *state)
++{
++	return container_of(state, struct el_primary_state, base);
++}
++
++static inline const struct el_primary_state *
++to_el_primary_state_const(const struct drm_plane_state *state)
++{
++	return container_of(state, const struct el_primary_state, base);
++}
++
++static inline struct el_overlay_state *to_el_overlay_state(struct drm_plane_state *state)
++{
++	return container_of(state, struct el_overlay_state, base);
++}
++
++static inline const struct el_overlay_state *
++to_el_overlay_state_const(const struct drm_plane_state *state)
++{
++	return container_of(state, const struct el_overlay_state, base);
++}
++
++static void el_write(struct el_display *el, u32 off, u32 val)
++{
++	writel(val, el->regs + off);
++}
++
++static void el_flags_commit(struct el_display *el)
++{
++	unsigned long flags;
++
++	spin_lock_irqsave(&el->reg_lock, flags);
++	el_write(el, EL_REG_FLAGS, el->flags_cache);
++	spin_unlock_irqrestore(&el->reg_lock, flags);
++}
++
++static u32 el_flags_get_prim_thresh(struct el_display *el)
++{
++	unsigned long flags;
++	u32 thresh;
++
++	spin_lock_irqsave(&el->reg_lock, flags);
++	thresh = (el->flags_cache & EL_FLAGS_PRIM_THRESH_MASK) >> EL_FLAGS_PRIM_THRESH_SHIFT;
++	spin_unlock_irqrestore(&el->reg_lock, flags);
++
++	return thresh;
++}
++
++static bool el_flags_get_dither(struct el_display *el)
++{
++	unsigned long flags;
++	bool dither;
++
++	spin_lock_irqsave(&el->reg_lock, flags);
++	dither = !!(el->flags_cache & EL_FLAGS_DITHER_EN);
++	spin_unlock_irqrestore(&el->reg_lock, flags);
++
++	return dither;
++}
++
++static void el_flags_update_primary(struct el_display *el, u32 dither, u32 prim_thresh)
++{
++	unsigned long flags;
++
++	spin_lock_irqsave(&el->reg_lock, flags);
++	el->flags_cache &= ~(EL_FLAGS_DITHER_EN | EL_FLAGS_PRIM_THRESH_MASK);
++	if (dither)
++		el->flags_cache |= EL_FLAGS_DITHER_EN;
++	el->flags_cache |= (prim_thresh << EL_FLAGS_PRIM_THRESH_SHIFT) &
++			   EL_FLAGS_PRIM_THRESH_MASK;
++	spin_unlock_irqrestore(&el->reg_lock, flags);
++}
++
++static void el_flags_update_ovl_thresh(struct el_display *el, u32 thresh)
++{
++	unsigned long flags;
++
++	spin_lock_irqsave(&el->reg_lock, flags);
++	el->flags_cache &= ~EL_FLAGS_THRESH_MASK;
++	el->flags_cache |= (thresh << EL_FLAGS_THRESH_SHIFT) & EL_FLAGS_THRESH_MASK;
++	spin_unlock_irqrestore(&el->reg_lock, flags);
++}
++
++static void el_flags_set_bit(struct el_display *el, u32 mask, bool set)
++{
++	unsigned long flags;
++
++	spin_lock_irqsave(&el->reg_lock, flags);
++	if (set)
++		el->flags_cache |= mask;
++	else
++		el->flags_cache &= ~mask;
++	spin_unlock_irqrestore(&el->reg_lock, flags);
++}
++
++static void el_flags_set_pfmt(struct el_display *el, u32 pfmt)
++{
++	unsigned long flags;
++
++	spin_lock_irqsave(&el->reg_lock, flags);
++	el->flags_cache &= ~(0x3 << EL_FLAGS_PFMT_SHIFT);
++	el->flags_cache |= (pfmt & 0x3) << EL_FLAGS_PFMT_SHIFT;
++	spin_unlock_irqrestore(&el->reg_lock, flags);
++}
++
++static const u32 el_primary_formats[] = {
++	DRM_FORMAT_XRGB8888,
++	DRM_FORMAT_ARGB8888,
++	DRM_FORMAT_NV12,
++};
++
++static const u32 el_overlay_formats[] = {
++	DRM_FORMAT_ARGB8888,
++};
++
++static const struct drm_display_mode el_fixed_mode = {
++	.name = "640x400",
++	.type = DRM_MODE_TYPE_DRIVER | DRM_MODE_TYPE_PREFERRED,
++	.clock = 48000,
++	.hdisplay = EL_WIDTH,
++	.hsync_start = EL_WIDTH,
++	.hsync_end = EL_WIDTH,
++	.htotal = 1000,
++	.vdisplay = EL_HEIGHT,
++	.vsync_start = EL_HEIGHT,
++	.vsync_end = EL_HEIGHT,
++	.vtotal = EL_HEIGHT,
++	.flags = DRM_MODE_FLAG_NHSYNC | DRM_MODE_FLAG_NVSYNC,
++};
++
++/* ---- CRTC ---- */
++
++static void el_crtc_atomic_enable(struct drm_crtc *crtc,
++				  struct drm_atomic_state *state)
++{
++	struct el_display *el = to_el_display(crtc->dev);
++
++	el_flags_set_bit(el, EL_FLAGS_ENABLE, true);
++	el_flags_commit(el);
++	drm_crtc_vblank_on(crtc);
++}
++
++static void el_crtc_atomic_disable(struct drm_crtc *crtc,
++				   struct drm_atomic_state *state)
++{
++	struct el_display *el = to_el_display(crtc->dev);
++
++	drm_crtc_vblank_off(crtc);
++	el_flags_set_bit(el, EL_FLAGS_ENABLE, false);
++	el_flags_commit(el);
++}
++
++static void el_crtc_atomic_flush(struct drm_crtc *crtc,
++				 struct drm_atomic_state *state)
++{
++	struct drm_crtc_state *crtc_state = drm_atomic_get_new_crtc_state(state, crtc);
++	struct drm_pending_vblank_event *event = crtc_state->event;
++
++	if (event) {
++		crtc_state->event = NULL;
++
++		spin_lock_irq(&crtc->dev->event_lock);
++		if (drm_crtc_vblank_get(crtc) == 0)
++			drm_crtc_arm_vblank_event(crtc, event);
++		else
++			drm_crtc_send_vblank_event(crtc, event);
++		spin_unlock_irq(&crtc->dev->event_lock);
++	}
++}
++
++static int el_crtc_enable_vblank(struct drm_crtc *crtc)
++{
++	struct el_display *el = to_el_display(crtc->dev);
++
++	enable_irq(el->irq);
++
++	return 0;
++}
++
++static void el_crtc_disable_vblank(struct drm_crtc *crtc)
++{
++	struct el_display *el = to_el_display(crtc->dev);
++
++	disable_irq_nosync(el->irq);
++}
++
++static const struct drm_crtc_funcs el_crtc_funcs = {
++	.reset = drm_atomic_helper_crtc_reset,
++	.destroy = drm_crtc_cleanup,
++	.set_config = drm_atomic_helper_set_config,
++	.page_flip = drm_atomic_helper_page_flip,
++	.atomic_duplicate_state = drm_atomic_helper_crtc_duplicate_state,
++	.atomic_destroy_state = drm_atomic_helper_crtc_destroy_state,
++	.enable_vblank = el_crtc_enable_vblank,
++	.disable_vblank = el_crtc_disable_vblank,
++};
++
++static const struct drm_crtc_helper_funcs el_crtc_helper_funcs = {
++	.atomic_enable = el_crtc_atomic_enable,
++	.atomic_disable = el_crtc_atomic_disable,
++	.atomic_flush = el_crtc_atomic_flush,
++};
++
++/* ---- primary plane ---- */
++
++static struct drm_plane_state *el_primary_atomic_duplicate_state(struct drm_plane *plane)
++{
++	struct el_primary_state *state;
++
++	if (WARN_ON(!plane->state))
++		return NULL;
++
++	state = kmemdup(to_el_primary_state(plane->state), sizeof(*state), GFP_KERNEL);
++	if (!state)
++		return NULL;
++
++	__drm_atomic_helper_plane_duplicate_state(plane, &state->base);
++
++	return &state->base;
++}
++
++static void el_primary_atomic_destroy_state(struct drm_plane *plane,
++					    struct drm_plane_state *state)
++{
++	__drm_atomic_helper_plane_destroy_state(state);
++	kfree(to_el_primary_state(state));
++}
++
++static void el_primary_reset(struct drm_plane *plane)
++{
++	struct el_display *el = to_el_display(plane->dev);
++	struct el_primary_state *state;
++
++	if (plane->state)
++		el_primary_atomic_destroy_state(plane, plane->state);
++
++	state = kzalloc(sizeof(*state), GFP_KERNEL);
++	if (!state)
++		return;
++
++	__drm_atomic_helper_plane_reset(plane, &state->base);
++	state->dither = EL_DITHER_DEFAULT;
++	state->prim_thresh = EL_PRIM_THRESH_DEFAULT;
++
++	el_flags_update_primary(el, state->dither, state->prim_thresh);
++	el_flags_commit(el);
++}
++
++static int el_primary_atomic_set_property(struct drm_plane *plane,
++					  struct drm_plane_state *state,
++					  struct drm_property *property,
++					  u64 val)
++{
++	struct el_display *el = to_el_display(plane->dev);
++	struct el_primary_state *el_state = to_el_primary_state(state);
++
++	if (property == el->primary_dither_prop) {
++		if (val > 1)
++			return -EINVAL;
++		el_state->dither = val;
++		return 0;
++	}
++
++	if (property == el->primary_thresh_prop) {
++		if (val > 255)
++			return -EINVAL;
++		el_state->prim_thresh = val;
++		return 0;
++	}
++
++	return -EINVAL;
++}
++
++static int el_primary_atomic_get_property(struct drm_plane *plane,
++					  const struct drm_plane_state *state,
++					  struct drm_property *property,
++					  u64 *val)
++{
++	struct el_display *el = to_el_display(plane->dev);
++	const struct el_primary_state *el_state = to_el_primary_state_const(state);
++
++	if (property == el->primary_dither_prop) {
++		*val = el_state->dither;
++		return 0;
++	}
++
++	if (property == el->primary_thresh_prop) {
++		*val = el_state->prim_thresh;
++		return 0;
++	}
++
++	return -EINVAL;
++}
++
++static bool el_primary_format_is_ar32(u32 format)
++{
++	return format == DRM_FORMAT_XRGB8888 || format == DRM_FORMAT_ARGB8888;
++}
++
++static int el_primary_atomic_check(struct drm_plane *plane,
++				   struct drm_atomic_state *state)
++{
++	struct drm_plane_state *new_state = drm_atomic_get_new_plane_state(state, plane);
++	struct drm_crtc_state *crtc_state;
++	struct drm_framebuffer *fb = new_state->fb;
++
++	if (!new_state->crtc)
++		return 0;
++
++	crtc_state = drm_atomic_get_new_crtc_state(state, new_state->crtc);
++	if (!crtc_state)
++		return -EINVAL;
++
++	if (fb) {
++		u32 format = fb->format->format;
++
++		if (fb->width != EL_WIDTH || fb->height != EL_HEIGHT)
++			return -EINVAL;
++
++		if (el_primary_format_is_ar32(format)) {
++			if (fb->pitches[0] != EL_PRIMARY_STRIDE)
++				return -EINVAL;
++		} else if (format != DRM_FORMAT_NV12) {
++			return -EINVAL;
++		}
++	}
++
++	return drm_atomic_helper_check_plane_state(new_state, crtc_state,
++						   0, INT_MAX, true, true);
++}
++
++static void el_primary_atomic_update(struct drm_plane *plane,
++				     struct drm_atomic_state *state)
++{
++	struct el_display *el = to_el_display(plane->dev);
++	struct drm_plane_state *new_state = drm_atomic_get_new_plane_state(state, plane);
++	struct drm_plane_state *old_state = drm_atomic_get_old_plane_state(state, plane);
++	struct el_primary_state *el_state = to_el_primary_state(new_state);
++	struct drm_framebuffer *fb = new_state->fb;
++	dma_addr_t dma_addr;
++	u32 pfmt = EL_FLAGS_PFMT_AR32;
++
++	if (fb) {
++		struct drm_gem_dma_object *dma_obj = drm_fb_dma_get_gem_obj(fb, 0);
++
++		if (dma_obj && dma_obj->base.import_attach)
++			drm_fb_dma_sync_non_coherent(plane->dev, old_state, new_state);
++
++		dma_addr = drm_fb_dma_get_gem_addr(fb, new_state, 0);
++		el_write(el, EL_REG_MAIN_BASE, lower_32_bits(dma_addr));
++		el_write(el, EL_REG_MAIN_STRIDE, fb->pitches[0]);
++
++		if (fb->format->format == DRM_FORMAT_NV12)
++			pfmt = EL_FLAGS_PFMT_NV12;
++
++		el_flags_set_pfmt(el, pfmt);
++	}
++
++	el_flags_update_primary(el, el_state->dither, el_state->prim_thresh);
++	el_flags_commit(el);
++}
++
++static const struct drm_plane_funcs el_primary_plane_funcs = {
++	.update_plane = drm_atomic_helper_update_plane,
++	.disable_plane = drm_atomic_helper_disable_plane,
++	.destroy = drm_plane_cleanup,
++	.reset = el_primary_reset,
++	.atomic_duplicate_state = el_primary_atomic_duplicate_state,
++	.atomic_destroy_state = el_primary_atomic_destroy_state,
++	.atomic_set_property = el_primary_atomic_set_property,
++	.atomic_get_property = el_primary_atomic_get_property,
++};
++
++static const struct drm_plane_helper_funcs el_primary_helper_funcs = {
++	.atomic_check = el_primary_atomic_check,
++	.atomic_update = el_primary_atomic_update,
++};
++
++/* ---- overlay plane ---- */
++
++static struct drm_plane_state *el_overlay_atomic_duplicate_state(struct drm_plane *plane)
++{
++	struct el_overlay_state *state;
++
++	if (WARN_ON(!plane->state))
++		return NULL;
++
++	state = kmemdup(to_el_overlay_state(plane->state), sizeof(*state), GFP_KERNEL);
++	if (!state)
++		return NULL;
++
++	__drm_atomic_helper_plane_duplicate_state(plane, &state->base);
++
++	return &state->base;
++}
++
++static void el_overlay_atomic_destroy_state(struct drm_plane *plane,
++					    struct drm_plane_state *state)
++{
++	__drm_atomic_helper_plane_destroy_state(state);
++	kfree(to_el_overlay_state(state));
++}
++
++static void el_overlay_reset(struct drm_plane *plane)
++{
++	struct el_display *el = to_el_display(plane->dev);
++	struct el_overlay_state *state;
++
++	if (plane->state)
++		el_overlay_atomic_destroy_state(plane, plane->state);
++
++	state = kzalloc(sizeof(*state), GFP_KERNEL);
++	if (!state)
++		return;
++
++	__drm_atomic_helper_plane_reset(plane, &state->base);
++	state->thresh = EL_OVL_THRESH_DEFAULT;
++
++	el_flags_update_ovl_thresh(el, state->thresh);
++	el_flags_commit(el);
++}
++
++static int el_overlay_atomic_set_property(struct drm_plane *plane,
++					    struct drm_plane_state *state,
++					    struct drm_property *property,
++					    u64 val)
++{
++	struct el_display *el = to_el_display(plane->dev);
++	struct el_overlay_state *el_state = to_el_overlay_state(state);
++
++	if (property == el->overlay_thresh_prop) {
++		if (val > 255)
++			return -EINVAL;
++		el_state->thresh = val;
++		return 0;
++	}
++
++	return -EINVAL;
++}
++
++static int el_overlay_atomic_get_property(struct drm_plane *plane,
++					  const struct drm_plane_state *state,
++					  struct drm_property *property,
++					  u64 *val)
++{
++	struct el_display *el = to_el_display(plane->dev);
++	const struct el_overlay_state *el_state = to_el_overlay_state_const(state);
++
++	if (property == el->overlay_thresh_prop) {
++		*val = el_state->thresh;
++		return 0;
++	}
++
++	return -EINVAL;
++}
++
++static int el_overlay_atomic_check(struct drm_plane *plane,
++				   struct drm_atomic_state *state)
++{
++	struct drm_plane_state *new_state = drm_atomic_get_new_plane_state(state, plane);
++	struct drm_crtc_state *crtc_state;
++
++	if (!new_state->fb)
++		return 0;
++
++	if (new_state->fb->format->format != DRM_FORMAT_ARGB8888)
++		return -EINVAL;
++
++	crtc_state = drm_atomic_get_new_crtc_state(state, new_state->crtc);
++	if (!crtc_state)
++		return -EINVAL;
++
++	if (new_state->src_w >> 16 != new_state->crtc_w ||
++	    new_state->src_h >> 16 != new_state->crtc_h)
++		return -EINVAL;
++
++	return drm_atomic_helper_check_plane_state(new_state, crtc_state,
++						   0, INT_MAX, true, true);
++}
++
++static void el_overlay_atomic_update(struct drm_plane *plane,
++				     struct drm_atomic_state *state)
++{
++	struct el_display *el = to_el_display(plane->dev);
++	struct drm_plane_state *new_state = drm_atomic_get_new_plane_state(state, plane);
++	struct el_overlay_state *el_state = to_el_overlay_state(new_state);
++	struct drm_framebuffer *fb = new_state->fb;
++	dma_addr_t dma_addr;
++	u32 src_x, src_y, src_w, src_h, dst_x, dst_y;
++
++	el_flags_update_ovl_thresh(el, el_state->thresh);
++
++	if (!fb) {
++		el_flags_commit(el);
++		return;
++	}
++
++	dma_addr = drm_fb_dma_get_gem_addr(fb, new_state, 0);
++	el_write(el, EL_REG_OVL_BASE, lower_32_bits(dma_addr));
++	el_write(el, EL_REG_OVL_STRIDE, fb->pitches[0]);
++
++	src_x = new_state->src_x >> 16;
++	src_y = new_state->src_y >> 16;
++	src_w = new_state->src_w >> 16;
++	src_h = new_state->src_h >> 16;
++	dst_x = new_state->crtc_x;
++	dst_y = new_state->crtc_y;
++
++	el_write(el, EL_REG_OVL_SRC_XY, (src_y << 16) | src_x);
++	el_write(el, EL_REG_OVL_SRC_WH, (src_h << 16) | src_w);
++	el_write(el, EL_REG_OVL_DST_XY, (dst_y << 16) | dst_x);
++
++	el_flags_set_bit(el, EL_FLAGS_OVL_EN, true);
++	el_flags_commit(el);
++}
++
++static void el_overlay_atomic_disable(struct drm_plane *plane,
++				      struct drm_atomic_state *state)
++{
++	struct el_display *el = to_el_display(plane->dev);
++
++	el_flags_set_bit(el, EL_FLAGS_OVL_EN, false);
++	el_flags_commit(el);
++}
++
++static const struct drm_plane_funcs el_overlay_plane_funcs = {
++	.update_plane = drm_atomic_helper_update_plane,
++	.disable_plane = drm_atomic_helper_disable_plane,
++	.destroy = drm_plane_cleanup,
++	.reset = el_overlay_reset,
++	.atomic_duplicate_state = el_overlay_atomic_duplicate_state,
++	.atomic_destroy_state = el_overlay_atomic_destroy_state,
++	.atomic_set_property = el_overlay_atomic_set_property,
++	.atomic_get_property = el_overlay_atomic_get_property,
++};
++
++static const struct drm_plane_helper_funcs el_overlay_helper_funcs = {
++	.atomic_check = el_overlay_atomic_check,
++	.atomic_update = el_overlay_atomic_update,
++	.atomic_disable = el_overlay_atomic_disable,
++};
++
++/* ---- encoder / connector ---- */
++
++static int el_connector_get_modes(struct drm_connector *connector)
++{
++	struct drm_display_mode *mode;
++
++	mode = drm_mode_duplicate(connector->dev, &el_fixed_mode);
++	if (!mode)
++		return -ENOMEM;
++
++	drm_mode_probed_add(connector, mode);
++	return 1;
++}
++
++static const struct drm_connector_helper_funcs el_connector_helper_funcs = {
++	.get_modes = el_connector_get_modes,
++};
++
++static const struct drm_connector_funcs el_connector_funcs = {
++	.reset = drm_atomic_helper_connector_reset,
++	.fill_modes = drm_helper_probe_single_connector_modes,
++	.atomic_duplicate_state = drm_atomic_helper_connector_duplicate_state,
++	.atomic_destroy_state = drm_atomic_helper_connector_destroy_state,
++	.destroy = drm_connector_cleanup,
++};
++
++static const struct drm_encoder_helper_funcs el_encoder_helper_funcs = {
++};
++
++static const struct drm_encoder_funcs el_encoder_funcs = {
++	.destroy = drm_encoder_cleanup,
++};
++
++/* ---- IRQ ---- */
++
++static irqreturn_t el_vsync_irq(int irq, void *data)
++{
++	struct el_display *el = data;
++
++	drm_crtc_handle_vblank(&el->crtc);
++
++	return IRQ_HANDLED;
++}
++
++/* ---- /dev/el_dither hack ---- */
++
++static struct class *el_dither_class;
++
++static int el_dither_open(struct inode *inode, struct file *file)
++{
++	struct el_display *el = container_of(inode->i_cdev, struct el_display, chrdev);
++
++	file->private_data = el;
++	return 0;
++}
++
++static ssize_t el_dither_read(struct file *file, char __user *buf, size_t count, loff_t *ppos)
++{
++	struct el_display *el = file->private_data;
++	char kbuf[4];
++	int len;
++
++	if (*ppos != 0)
++		return 0;
++
++	len = scnprintf(kbuf, sizeof(kbuf), "%d\n", el_flags_get_dither(el) ? 1 : 0);
++	if (count < len)
++		return -EINVAL;
++
++	if (copy_to_user(buf, kbuf, len))
++		return -EFAULT;
++
++	*ppos = len;
++	return len;
++}
++
++static ssize_t el_dither_write(struct file *file, const char __user *buf,
++			       size_t count, loff_t *ppos)
++{
++	struct el_display *el = file->private_data;
++	char kbuf[8];
++	unsigned long val;
++	int ret;
++
++	if (*ppos != 0)
++		return -EINVAL;
++
++	if (count == 0 || count >= sizeof(kbuf))
++		return -EINVAL;
++
++	if (copy_from_user(kbuf, buf, count))
++		return -EFAULT;
++
++	kbuf[count] = '\0';
++	ret = kstrtoul(kbuf, 10, &val);
++	if (ret || val > 1)
++		return -EINVAL;
++
++	el_flags_update_primary(el, val, el_flags_get_prim_thresh(el));
++	el_flags_commit(el);
++
++	return count;
++}
++
++static const struct file_operations el_dither_fops = {
++	.owner = THIS_MODULE,
++	.open = el_dither_open,
++	.read = el_dither_read,
++	.write = el_dither_write,
++	.llseek = noop_llseek,
++};
++
++static int el_dither_chrdev_register(struct el_display *el)
++{
++	int ret;
++
++	ret = alloc_chrdev_region(&el->chrdev_devt, 0, 1, "el_dither");
++	if (ret)
++		return ret;
++
++	cdev_init(&el->chrdev, &el_dither_fops);
++	ret = cdev_add(&el->chrdev, el->chrdev_devt, 1);
++	if (ret)
++		goto err_unregister;
++
++	el_dither_class = class_create("el_dither");
++	if (IS_ERR(el_dither_class)) {
++		ret = PTR_ERR(el_dither_class);
++		goto err_cdev_del;
++	}
++
++	el->chrdev_device = device_create(el_dither_class, el->dev, el->chrdev_devt, el,
++					  "el_dither");
++	if (IS_ERR(el->chrdev_device)) {
++		ret = PTR_ERR(el->chrdev_device);
++		goto err_class_destroy;
++	}
++
++	return 0;
++
++err_class_destroy:
++	class_destroy(el_dither_class);
++	el_dither_class = NULL;
++err_cdev_del:
++	cdev_del(&el->chrdev);
++err_unregister:
++	unregister_chrdev_region(el->chrdev_devt, 1);
++	return ret;
++}
++
++static void el_dither_chrdev_unregister(struct el_display *el)
++{
++	device_destroy(el_dither_class, el->chrdev_devt);
++	class_destroy(el_dither_class);
++	el_dither_class = NULL;
++	cdev_del(&el->chrdev);
++	unregister_chrdev_region(el->chrdev_devt, 1);
++}
++
++/* ---- mode config ---- */
++
++static const struct drm_mode_config_funcs el_mode_config_funcs = {
++	.fb_create = drm_gem_fb_create,
++	.atomic_check = drm_atomic_helper_check,
++	.atomic_commit = drm_atomic_helper_commit,
++};
++
++static int el_display_create_properties(struct el_display *el)
++{
++	struct drm_device *drm = &el->drm;
++
++	el->primary_dither_prop = drm_property_create_range(drm, 0, "DITHERING", 0, 1);
++	if (!el->primary_dither_prop)
++		return -ENOMEM;
++
++	el->primary_thresh_prop = drm_property_create_range(drm, 0, "PRIM_THRESH", 0, 255);
++	if (!el->primary_thresh_prop)
++		return -ENOMEM;
++
++	el->overlay_thresh_prop = drm_property_create_range(drm, 0, "THRESH", 0, 255);
++	if (!el->overlay_thresh_prop)
++		return -ENOMEM;
++
++	drm_object_attach_property(&el->primary.base, el->primary_dither_prop,
++				   EL_DITHER_DEFAULT);
++	drm_object_attach_property(&el->primary.base, el->primary_thresh_prop,
++				   EL_PRIM_THRESH_DEFAULT);
++	drm_object_attach_property(&el->overlay.base, el->overlay_thresh_prop,
++				   EL_OVL_THRESH_DEFAULT);
++
++	return 0;
++}
++
++static int el_display_kms_init(struct el_display *el)
++{
++	struct drm_device *drm = &el->drm;
++	int ret;
++
++	drm_mode_config_init(drm);
++	drm->mode_config.funcs = &el_mode_config_funcs;
++	drm->mode_config.min_width = EL_WIDTH;
++	drm->mode_config.max_width = EL_WIDTH;
++	drm->mode_config.min_height = EL_HEIGHT;
++	drm->mode_config.max_height = EL_HEIGHT;
++
++	ret = drm_universal_plane_init(drm, &el->primary, 0,
++				       &el_primary_plane_funcs,
++				       el_primary_formats,
++				       ARRAY_SIZE(el_primary_formats),
++				       NULL, DRM_PLANE_TYPE_PRIMARY, NULL);
++	if (ret)
++		return ret;
++
++	drm_plane_helper_add(&el->primary, &el_primary_helper_funcs);
++
++	ret = drm_universal_plane_init(drm, &el->overlay, 0,
++				       &el_overlay_plane_funcs,
++				       el_overlay_formats,
++				       ARRAY_SIZE(el_overlay_formats),
++				       NULL, DRM_PLANE_TYPE_OVERLAY, NULL);
++	if (ret)
++		return ret;
++
++	drm_plane_helper_add(&el->overlay, &el_overlay_helper_funcs);
++	drm_plane_create_zpos_immutable_property(&el->primary, 0);
++	drm_plane_create_zpos_immutable_property(&el->overlay, 1);
++
++	ret = el_display_create_properties(el);
++	if (ret)
++		return ret;
++
++	ret = drm_crtc_init_with_planes(drm, &el->crtc, &el->primary, &el->overlay,
++					&el_crtc_funcs, NULL);
++	if (ret)
++		return ret;
++
++	drm_crtc_helper_add(&el->crtc, &el_crtc_helper_funcs);
++
++	ret = drm_encoder_init(drm, &el->encoder, &el_encoder_funcs,
++			       DRM_MODE_ENCODER_NONE, NULL);
++	if (ret)
++		return ret;
++
++	el->encoder.possible_crtcs = drm_crtc_mask(&el->crtc);
++	drm_encoder_helper_add(&el->encoder, &el_encoder_helper_funcs);
++
++	ret = drm_connector_init(drm, &el->connector, &el_connector_funcs,
++				 DRM_MODE_CONNECTOR_Unknown);
++	if (ret)
++		return ret;
++
++	drm_connector_helper_add(&el->connector, &el_connector_helper_funcs);
++	el->connector.polled = DRM_CONNECTOR_POLL_HPD;
++
++	ret = drm_connector_attach_encoder(&el->connector, &el->encoder);
++	if (ret)
++		return ret;
++
++	ret = drm_vblank_init(drm, 1);
++	if (ret)
++		return ret;
++
++	/* defaults: primary thresh 128, overlay thresh 127, display off */
++	el->flags_cache = (EL_PRIM_THRESH_DEFAULT << EL_FLAGS_PRIM_THRESH_SHIFT) |
++			  (EL_OVL_THRESH_DEFAULT << EL_FLAGS_THRESH_SHIFT);
++	if (EL_DITHER_DEFAULT)
++		el->flags_cache |= EL_FLAGS_DITHER_EN;
++	el_flags_commit(el);
++
++	drm_mode_config_reset(drm);
++
++	return 0;
++}
++
++DEFINE_DRM_GEM_DMA_FOPS(el_fops);
++
++static struct drm_driver el_display_driver = {
++	.driver_features = DRIVER_GEM | DRIVER_MODESET | DRIVER_ATOMIC,
++	.name = EL_DISPLAY_NAME,
++	.desc = "el_display_engine DRM driver",
++	.date = "20260603",
++	.major = 1,
++	.minor = 0,
++	.fops = &el_fops,
++	DRM_GEM_DMA_DRIVER_OPS,
++};
++
++static int el_display_probe(struct platform_device *pdev)
++{
++	struct device *dev = &pdev->dev;
++	struct el_display *el;
++	struct drm_device *drm;
++	int ret;
++
++	if (!dev->of_node)
++		return -ENODEV;
++
++	pr_info("el_display_engine: probe (%s)\n",
++		of_node_full_name(dev->of_node));
++
++	el = devm_drm_dev_alloc(dev, &el_display_driver, struct el_display, drm);
++	if (IS_ERR(el))
++		return PTR_ERR(el);
++
++	el->dev = dev;
++	platform_set_drvdata(pdev, el);
++
++	ret = dma_set_mask_and_coherent(dev, DMA_BIT_MASK(32));
++	if (ret)
++		return ret;
++
++	el->regs = devm_platform_ioremap_resource(pdev, 0);
++	if (IS_ERR(el->regs))
++		return PTR_ERR(el->regs);
++
++	el->m00_axi_aclk = devm_clk_get(dev, "m00_axi_aclk");
++	if (IS_ERR(el->m00_axi_aclk))
++		return dev_err_probe(dev, PTR_ERR(el->m00_axi_aclk),
++				     "missing m00_axi_aclk\n");
++
++	el->pix_clk = devm_clk_get(dev, "pix_clk");
++	if (IS_ERR(el->pix_clk))
++		return dev_err_probe(dev, PTR_ERR(el->pix_clk), "missing pix_clk\n");
++
++	el->s00_axi_aclk = devm_clk_get(dev, "s00_axi_aclk");
++	if (IS_ERR(el->s00_axi_aclk))
++		return dev_err_probe(dev, PTR_ERR(el->s00_axi_aclk),
++				     "missing s00_axi_aclk\n");
++
++	ret = clk_prepare_enable(el->m00_axi_aclk);
++	if (ret)
++		return ret;
++
++	ret = clk_prepare_enable(el->pix_clk);
++	if (ret)
++		goto err_m00;
++
++	ret = clk_prepare_enable(el->s00_axi_aclk);
++	if (ret)
++		goto err_pix;
++
++	el->irq = platform_get_irq(pdev, 0);
++	if (el->irq < 0) {
++		ret = el->irq;
++		goto err_s00;
++	}
++
++	spin_lock_init(&el->reg_lock);
++
++	ret = devm_request_irq(dev, el->irq, el_vsync_irq, IRQF_TRIGGER_RISING,
++			       dev_name(dev), el);
++	if (ret)
++		goto err_s00;
++
++	drm = &el->drm;
++	ret = el_display_kms_init(el);
++	if (ret)
++		goto err_s00;
++
++	ret = drm_dev_register(drm, 0);
++	if (ret)
++		goto err_s00;
++
++	ret = el_dither_chrdev_register(el);
++	if (ret)
++		dev_warn(dev, "failed to register /dev/el_dither: %d\n", ret);
++
++	drm_fbdev_dma_setup(drm, 32);
++
++	dev_info(dev, "el_display_engine DRM driver loaded\n");
++
++	return 0;
++
++err_s00:
++	clk_disable_unprepare(el->s00_axi_aclk);
++err_pix:
++	clk_disable_unprepare(el->pix_clk);
++err_m00:
++	clk_disable_unprepare(el->m00_axi_aclk);
++	return ret;
++}
++
++static void el_display_remove(struct platform_device *pdev)
++{
++	struct el_display *el = platform_get_drvdata(pdev);
++
++	if (el->chrdev_device)
++		el_dither_chrdev_unregister(el);
++	drm_dev_unregister(&el->drm);
++	drm_atomic_helper_shutdown(&el->drm);
++	clk_disable_unprepare(el->s00_axi_aclk);
++	clk_disable_unprepare(el->pix_clk);
++	clk_disable_unprepare(el->m00_axi_aclk);
++}
++
++static void el_display_shutdown(struct platform_device *pdev)
++{
++	struct el_display *el = platform_get_drvdata(pdev);
++
++	drm_atomic_helper_shutdown(&el->drm);
++}
++
++static const struct of_device_id el_display_of_match[] = {
++	{ .compatible = "xlnx,el-display-engine-1.0" },
++	{ }
++};
++#ifdef MODULE
++MODULE_DEVICE_TABLE(of, el_display_of_match);
++#endif
++
++static struct platform_driver el_display_platform_driver = {
++	.probe = el_display_probe,
++	.remove = el_display_remove,
++	.shutdown = el_display_shutdown,
++	.driver = {
++		.name = EL_DISPLAY_NAME,
++		.of_match_table = el_display_of_match,
++	},
++};
++
++#if IS_BUILTIN(CONFIG_DRM_EL_DISPLAY)
++static int __init el_display_drm_init(void)
++{
++	pr_info("el_display_engine: built-in DRM driver registering\n");
++	return platform_driver_register(&el_display_platform_driver);
++}
++device_initcall(el_display_drm_init);
++#else
++module_platform_driver(el_display_platform_driver);
++#endif
++
++#ifdef MODULE
++MODULE_DESCRIPTION("DRM/KMS driver for el_display_engine PL IP");
++MODULE_AUTHOR("PetaLinux user");
++MODULE_LICENSE("GPL");
++#endif
