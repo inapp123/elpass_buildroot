@@ -27,9 +27,9 @@ before loading U-Boot (CONFIG_SPL_FPGA is enabled in xilinx_zynq_virt).
 
 Board files:
 
- - elpass.dts          Linux device tree
- - elpass-uboot.dts    U-Boot device tree
- - pl.dtsi             PL 外设 (el_display_engine 等)
+ - dts/elpass.dts          Linux device tree
+ - dts/elpass-uboot.dts    U-Boot device tree
+ - dts/pl.dtsi             PL 外设 (el_display_engine 等)
  - ps7_init_gpl.c/h    PS7 initialization (from Vivado)
  - system.bit          FPGA bitstream (not in git, add locally)
  - u-boot-fpga.its     FIT source: SPL loads fpga-1 then firmware-1

@@ -54,3 +54,24 @@
 	dr_mode = "host";
 	usb-phy = <&usb_phy0>;
 };
+
+&spi0 {
+	xpt2046@0 {
+		reg = <0>;	/* CS0 */
+		compatible = "ti,ads7846";
+		interrupt-parent = <&gpio1>;
+		interrupts = <8 0>;	/* BOOT6 / GPIO 8 */
+		spi-max-frequency = <1000000>;
+		pendown-gpio = <&gpio1 8 0>;
+		vcc-supply = <&reg_vcc3>;
+
+		ti,x-min = /bits/ 16 <0>;
+		ti,x-max = /bits/ 16 <8000>;
+		ti,y-min = /bits/ 16 <0>;
+		ti,y-max = /bits/ 16 <4800>;
+		ti,x-plate-ohms = /bits/ 16 <40>;
+		ti,pressure-max = /bits/ 16 <255>;
+
+		wakeup-source;
+	};
+};

@@ -3,7 +3,7 @@ From: Buildroot <buildroot@buildroot.org>
 Date: Wed, 1 Jul 2026 02:06:00 +0800
 Subject: [PATCH] arm: dts: build elpass U-Boot device tree
 
-Buildroot copies board/rhodesisland/elpass/elpass-uboot.dts into
+Buildroot copies board/rhodesisland/elpass/dts/elpass-uboot.dts into
 arch/arm/dts through BR2_TARGET_UBOOT_CUSTOM_DTS_PATH and builds U-Boot
 with DEVICE_TREE=elpass-uboot.
 
